@@ -189,848 +189,1000 @@ function resampler(input, targetSampleRate, oncomplete) {
 
 module.exports = resampler;
 
-},{"wav-encoder":9,"webaudioloader":12}],3:[function(require,module,exports){
-module.exports = DragDrop
+},{"wav-encoder":8,"webaudioloader":9}],3:[function(require,module,exports){
+module.exports = dragDrop
 
-var throttle = require('lodash.throttle')
+var flatten = require('flatten')
+var parallel = require('run-parallel')
 
-function DragDrop (elem, cb) {
-  if (typeof elem === 'string') elem = document.querySelector(elem)
-  elem.addEventListener('dragenter', killEvent, false)
-  elem.addEventListener('dragover', makeOnDragOver(elem), false)
-  elem.addEventListener('drop', onDrop.bind(undefined, elem, cb), false)
-}
+function dragDrop (elem, listeners) {
+  if (typeof elem === 'string') {
+    var selector = elem
+    elem = window.document.querySelector(elem)
+    if (!elem) {
+      throw new Error('"' + selector + '" does not match any HTML elements')
+    }
+  }
 
-function killEvent (e) {
-  e.stopPropagation()
-  e.preventDefault()
-  return false
-}
+  if (!elem) {
+    throw new Error('"' + elem + '" is not a valid HTML element')
+  }
 
-function makeOnDragOver (elem) {
-  var fn = throttle(function () {
-    elem.classList.add('drag')
+  if (typeof listeners === 'function') {
+    listeners = { onDrop: listeners }
+  }
 
-    if (elem.timeout) clearTimeout(elem.timeout)
-    elem.timeout = setTimeout(function () {
-      elem.classList.remove('drag')
-    }, 150)
-  }, 100, {trailing: false})
+  var timeout
 
-  return function (e) {
+  elem.addEventListener('dragenter', onDragEnter, false)
+  elem.addEventListener('dragover', onDragOver, false)
+  elem.addEventListener('dragleave', onDragLeave, false)
+  elem.addEventListener('drop', onDrop, false)
+
+  // Function to remove drag-drop listeners
+  return function remove () {
+    removeDragClass()
+    elem.removeEventListener('dragenter', onDragEnter, false)
+    elem.removeEventListener('dragover', onDragOver, false)
+    elem.removeEventListener('dragleave', onDragLeave, false)
+    elem.removeEventListener('drop', onDrop, false)
+  }
+
+  function onDragEnter (e) {
+    if (listeners.onDragEnter) {
+      listeners.onDragEnter(e)
+    }
+
+    // Prevent event
     e.stopPropagation()
     e.preventDefault()
+    return false
+  }
+
+  function onDragOver (e) {
+    e.stopPropagation()
+    e.preventDefault()
+    if (e.dataTransfer.items) {
+      // Only add "drag" class when `items` contains items that are able to be
+      // handled by the registered listeners (files vs. text)
+      var items = toArray(e.dataTransfer.items)
+      var fileItems = items.filter(function (item) { return item.kind === 'file' })
+      var textItems = items.filter(function (item) { return item.kind === 'string' })
+
+      if (fileItems.length === 0 && !listeners.onDropText) return
+      if (textItems.length === 0 && !listeners.onDrop) return
+      if (fileItems.length === 0 && textItems.length === 0) return
+    }
+
+    elem.classList.add('drag')
+    clearTimeout(timeout)
+
+    if (listeners.onDragOver) {
+      listeners.onDragOver(e)
+    }
+
     e.dataTransfer.dropEffect = 'copy'
-    fn()
+    return false
+  }
+
+  function onDragLeave (e) {
+    e.stopPropagation()
+    e.preventDefault()
+
+    if (listeners.onDragLeave) {
+      listeners.onDragLeave(e)
+    }
+
+    clearTimeout(timeout)
+    timeout = setTimeout(removeDragClass, 50)
+
+    return false
+  }
+
+  function onDrop (e) {
+    e.stopPropagation()
+    e.preventDefault()
+
+    if (listeners.onDragLeave) {
+      listeners.onDragLeave(e)
+    }
+
+    clearTimeout(timeout)
+    removeDragClass()
+
+    var pos = {
+      x: e.clientX,
+      y: e.clientY
+    }
+
+    // text drop support
+    var text = e.dataTransfer.getData('text')
+    if (text && listeners.onDropText) {
+      listeners.onDropText(text, pos)
+    }
+
+    // file drop support
+    if (e.dataTransfer.items) {
+      // Handle directories in Chrome using the proprietary FileSystem API
+      var items = toArray(e.dataTransfer.items).filter(function (item) {
+        return item.kind === 'file'
+      })
+
+      if (items.length === 0) return
+
+      parallel(items.map(function (item) {
+        return function (cb) {
+          processEntry(item.webkitGetAsEntry(), cb)
+        }
+      }), function (err, results) {
+        // This catches permission errors with file:// in Chrome. This should never
+        // throw in production code, so the user does not need to use try-catch.
+        if (err) throw err
+        if (listeners.onDrop) {
+          listeners.onDrop(flatten(results), pos)
+        }
+      })
+    } else {
+      var files = toArray(e.dataTransfer.files)
+
+      if (files.length === 0) return
+
+      files.forEach(function (file) {
+        file.fullPath = '/' + file.name
+      })
+
+      if (listeners.onDrop) {
+        listeners.onDrop(files, pos)
+      }
+    }
+
+    return false
+  }
+
+  function removeDragClass () {
+    elem.classList.remove('drag')
   }
 }
 
-function onDrop (elem, cb, e) {
-  e.stopPropagation()
-  e.preventDefault()
-  elem.classList.remove('drag')
-  cb(Array.prototype.slice.call(e.dataTransfer.files), { x: e.clientX, y: e.clientY })
-  return false
+function processEntry (entry, cb) {
+  var entries = []
+
+  if (entry.isFile) {
+    entry.file(function (file) {
+      file.fullPath = entry.fullPath  // preserve pathing for consumer
+      cb(null, file)
+    }, function (err) {
+      cb(err)
+    })
+  } else if (entry.isDirectory) {
+    var reader = entry.createReader()
+    readEntries()
+  }
+
+  function readEntries () {
+    reader.readEntries(function (entries_) {
+      if (entries_.length > 0) {
+        entries = entries.concat(toArray(entries_))
+        readEntries() // continue reading entries until `readEntries` returns no more
+      } else {
+        doneEntries()
+      }
+    })
+  }
+
+  function doneEntries () {
+    parallel(entries.map(function (entry) {
+      return function (cb) {
+        processEntry(entry, cb)
+      }
+    }), cb)
+  }
 }
 
-},{"lodash.throttle":4}],4:[function(require,module,exports){
-/**
- * lodash 3.0.1 (Custom Build) <https://lodash.com/>
- * Build: `lodash modern modularize exports="npm" -o ./`
- * Copyright 2012-2015 The Dojo Foundation <http://dojofoundation.org/>
- * Based on Underscore.js 1.7.0 <http://underscorejs.org/LICENSE>
- * Copyright 2009-2015 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
- * Available under MIT license <https://lodash.com/license>
- */
-var debounce = require('lodash.debounce');
+function toArray (list) {
+  return Array.prototype.slice.call(list || [], 0)
+}
 
-/** Used as the `TypeError` message for "Functions" methods. */
-var FUNC_ERROR_TEXT = 'Expected a function';
+},{"flatten":4,"run-parallel":7}],4:[function(require,module,exports){
+module.exports = function flatten(list, depth) {
+  depth = (typeof depth == 'number') ? depth : Infinity;
 
-/** Used as an internal `_.debounce` options object by `_.throttle`. */
-var debounceOptions = {
-  'leading': false,
-  'maxWait': 0,
-  'trailing': false
+  if (!depth) {
+    if (Array.isArray(list)) {
+      return list.map(function(i) { return i; });
+    }
+    return list;
+  }
+
+  return _flatten(list, 1);
+
+  function _flatten(list, d) {
+    return list.reduce(function (acc, item) {
+      if (Array.isArray(item) && d < depth) {
+        return acc.concat(_flatten(item, d + 1));
+      }
+      else {
+        return acc.concat(item);
+      }
+    }, []);
+  }
 };
 
-/**
- * Creates a function that only invokes `func` at most once per every `wait`
- * milliseconds. The created function comes with a `cancel` method to cancel
- * delayed invocations. Provide an options object to indicate that `func`
- * should be invoked on the leading and/or trailing edge of the `wait` timeout.
- * Subsequent calls to the throttled function return the result of the last
- * `func` call.
- *
- * **Note:** If `leading` and `trailing` options are `true`, `func` is invoked
- * on the trailing edge of the timeout only if the the throttled function is
- * invoked more than once during the `wait` timeout.
- *
- * See [David Corbacho's article](http://drupalmotion.com/article/debounce-and-throttle-visual-explanation)
- * for details over the differences between `_.throttle` and `_.debounce`.
- *
- * @static
- * @memberOf _
- * @category Function
- * @param {Function} func The function to throttle.
- * @param {number} wait The number of milliseconds to throttle invocations to.
- * @param {Object} [options] The options object.
- * @param {boolean} [options.leading=true] Specify invoking on the leading
- *  edge of the timeout.
- * @param {boolean} [options.trailing=true] Specify invoking on the trailing
- *  edge of the timeout.
- * @returns {Function} Returns the new throttled function.
- * @example
- *
- * // avoid excessively updating the position while scrolling
- * jQuery(window).on('scroll', _.throttle(updatePosition, 100));
- *
- * // invoke `renewToken` when the click event is fired, but not more than once every 5 minutes
- * var throttled =  _.throttle(renewToken, 300000, { 'trailing': false })
- * jQuery('.interactive').on('click', throttled);
- *
- * // cancel a trailing throttled call
- * jQuery(window).on('popstate', throttled.cancel);
- */
-function throttle(func, wait, options) {
-  var leading = true,
-      trailing = true;
+},{}],5:[function(require,module,exports){
+;(function () { // closure for web browsers
 
-  if (typeof func != 'function') {
-    throw new TypeError(FUNC_ERROR_TEXT);
-  }
-  if (options === false) {
-    leading = false;
-  } else if (isObject(options)) {
-    leading = 'leading' in options ? !!options.leading : leading;
-    trailing = 'trailing' in options ? !!options.trailing : trailing;
-  }
-  debounceOptions.leading = leading;
-  debounceOptions.maxWait = +wait;
-  debounceOptions.trailing = trailing;
-  return debounce(func, wait, debounceOptions);
+if (typeof module === 'object' && module.exports) {
+  module.exports = LRUCache
+} else {
+  // just set the global for non-node platforms.
+  this.LRUCache = LRUCache
 }
 
-/**
- * Checks if `value` is the language type of `Object`.
- * (e.g. arrays, functions, objects, regexes, `new Number(0)`, and `new String('')`)
- *
- * **Note:** See the [ES5 spec](https://es5.github.io/#x8) for more details.
- *
- * @static
- * @memberOf _
- * @category Lang
- * @param {*} value The value to check.
- * @returns {boolean} Returns `true` if `value` is an object, else `false`.
- * @example
- *
- * _.isObject({});
- * // => true
- *
- * _.isObject([1, 2, 3]);
- * // => true
- *
- * _.isObject(1);
- * // => false
- */
-function isObject(value) {
-  // Avoid a V8 JIT bug in Chrome 19-20.
-  // See https://code.google.com/p/v8/issues/detail?id=2291 for more details.
-  var type = typeof value;
-  return type == 'function' || (value && type == 'object') || false;
+function hOP (obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key)
 }
 
-module.exports = throttle;
+function naiveLength () { return 1 }
 
-},{"lodash.debounce":5}],5:[function(require,module,exports){
-/**
- * lodash 3.0.2 (Custom Build) <https://lodash.com/>
- * Build: `lodash modern modularize exports="npm" -o ./`
- * Copyright 2012-2015 The Dojo Foundation <http://dojofoundation.org/>
- * Based on Underscore.js 1.8.2 <http://underscorejs.org/LICENSE>
- * Copyright 2009-2015 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
- * Available under MIT license <https://lodash.com/license>
- */
-var isNative = require('lodash.isnative');
+var didTypeWarning = false
+function typeCheckKey(key) {
+  if (!didTypeWarning && typeof key !== 'string' && typeof key !== 'number') {
+    didTypeWarning = true
+    console.error(new TypeError("LRU: key must be a string or number. Almost certainly a bug! " + typeof key).stack)
+  }
+}
 
-/** Used as the `TypeError` message for "Functions" methods. */
-var FUNC_ERROR_TEXT = 'Expected a function';
+function LRUCache (options) {
+  if (!(this instanceof LRUCache))
+    return new LRUCache(options)
 
-/* Native method references for those with the same name as other `lodash` methods. */
-var nativeMax = Math.max,
-    nativeNow = isNative(nativeNow = Date.now) && nativeNow;
+  if (typeof options === 'number')
+    options = { max: options }
 
-/**
- * Gets the number of milliseconds that have elapsed since the Unix epoch
- * (1 January 1970 00:00:00 UTC).
- *
- * @static
- * @memberOf _
- * @category Date
- * @example
- *
- * _.defer(function(stamp) {
- *   console.log(_.now() - stamp);
- * }, _.now());
- * // => logs the number of milliseconds it took for the deferred function to be invoked
- */
-var now = nativeNow || function() {
-  return new Date().getTime();
+  if (!options)
+    options = {}
+
+  this._max = options.max
+  // Kind of weird to have a default max of Infinity, but oh well.
+  if (!this._max || !(typeof this._max === "number") || this._max <= 0 )
+    this._max = Infinity
+
+  this._lengthCalculator = options.length || naiveLength
+  if (typeof this._lengthCalculator !== "function")
+    this._lengthCalculator = naiveLength
+
+  this._allowStale = options.stale || false
+  this._maxAge = options.maxAge || null
+  this._dispose = options.dispose
+  this.reset()
+}
+
+// resize the cache when the max changes.
+Object.defineProperty(LRUCache.prototype, "max",
+  { set : function (mL) {
+      if (!mL || !(typeof mL === "number") || mL <= 0 ) mL = Infinity
+      this._max = mL
+      if (this._length > this._max) trim(this)
+    }
+  , get : function () { return this._max }
+  , enumerable : true
+  })
+
+// resize the cache when the lengthCalculator changes.
+Object.defineProperty(LRUCache.prototype, "lengthCalculator",
+  { set : function (lC) {
+      if (typeof lC !== "function") {
+        this._lengthCalculator = naiveLength
+        this._length = this._itemCount
+        for (var key in this._cache) {
+          this._cache[key].length = 1
+        }
+      } else {
+        this._lengthCalculator = lC
+        this._length = 0
+        for (var key in this._cache) {
+          this._cache[key].length = this._lengthCalculator(this._cache[key].value)
+          this._length += this._cache[key].length
+        }
+      }
+
+      if (this._length > this._max) trim(this)
+    }
+  , get : function () { return this._lengthCalculator }
+  , enumerable : true
+  })
+
+Object.defineProperty(LRUCache.prototype, "length",
+  { get : function () { return this._length }
+  , enumerable : true
+  })
+
+
+Object.defineProperty(LRUCache.prototype, "itemCount",
+  { get : function () { return this._itemCount }
+  , enumerable : true
+  })
+
+LRUCache.prototype.forEach = function (fn, thisp) {
+  thisp = thisp || this
+  var i = 0
+  var itemCount = this._itemCount
+
+  for (var k = this._mru - 1; k >= 0 && i < itemCount; k--) if (this._lruList[k]) {
+    i++
+    var hit = this._lruList[k]
+    if (isStale(this, hit)) {
+      del(this, hit)
+      if (!this._allowStale) hit = undefined
+    }
+    if (hit) {
+      fn.call(thisp, hit.value, hit.key, this)
+    }
+  }
+}
+
+LRUCache.prototype.keys = function () {
+  var keys = new Array(this._itemCount)
+  var i = 0
+  for (var k = this._mru - 1; k >= 0 && i < this._itemCount; k--) if (this._lruList[k]) {
+    var hit = this._lruList[k]
+    keys[i++] = hit.key
+  }
+  return keys
+}
+
+LRUCache.prototype.values = function () {
+  var values = new Array(this._itemCount)
+  var i = 0
+  for (var k = this._mru - 1; k >= 0 && i < this._itemCount; k--) if (this._lruList[k]) {
+    var hit = this._lruList[k]
+    values[i++] = hit.value
+  }
+  return values
+}
+
+LRUCache.prototype.reset = function () {
+  if (this._dispose && this._cache) {
+    for (var k in this._cache) {
+      this._dispose(k, this._cache[k].value)
+    }
+  }
+
+  this._cache = Object.create(null) // hash of items by key
+  this._lruList = Object.create(null) // list of items in order of use recency
+  this._mru = 0 // most recently used
+  this._lru = 0 // least recently used
+  this._length = 0 // number of items in the list
+  this._itemCount = 0
+}
+
+LRUCache.prototype.dump = function () {
+  var arr = []
+  var i = 0
+
+  for (var k = this._mru - 1; k >= 0 && i < this._itemCount; k--) if (this._lruList[k]) {
+    var hit = this._lruList[k]
+    if (!isStale(this, hit)) {
+      //Do not store staled hits
+      ++i
+      arr.push({
+        k: hit.key,
+        v: hit.value,
+        e: hit.now + (hit.maxAge || 0)
+      });
+    }
+  }
+  //arr has the most read first
+  return arr
+}
+
+LRUCache.prototype.dumpLru = function () {
+  return this._lruList
+}
+
+LRUCache.prototype.set = function (key, value, maxAge) {
+  maxAge = maxAge || this._maxAge
+  typeCheckKey(key)
+
+  var now = maxAge ? Date.now() : 0
+  var len = this._lengthCalculator(value)
+
+  if (hOP(this._cache, key)) {
+    if (len > this._max) {
+      del(this, this._cache[key])
+      return false
+    }
+    // dispose of the old one before overwriting
+    if (this._dispose)
+      this._dispose(key, this._cache[key].value)
+
+    this._cache[key].now = now
+    this._cache[key].maxAge = maxAge
+    this._cache[key].value = value
+    this._length += (len - this._cache[key].length)
+    this._cache[key].length = len
+    this.get(key)
+
+    if (this._length > this._max)
+      trim(this)
+
+    return true
+  }
+
+  var hit = new Entry(key, value, this._mru++, len, now, maxAge)
+
+  // oversized objects fall out of cache automatically.
+  if (hit.length > this._max) {
+    if (this._dispose) this._dispose(key, value)
+    return false
+  }
+
+  this._length += hit.length
+  this._lruList[hit.lu] = this._cache[key] = hit
+  this._itemCount ++
+
+  if (this._length > this._max)
+    trim(this)
+
+  return true
+}
+
+LRUCache.prototype.has = function (key) {
+  typeCheckKey(key)
+  if (!hOP(this._cache, key)) return false
+  var hit = this._cache[key]
+  if (isStale(this, hit)) {
+    return false
+  }
+  return true
+}
+
+LRUCache.prototype.get = function (key) {
+  typeCheckKey(key)
+  return get(this, key, true)
+}
+
+LRUCache.prototype.peek = function (key) {
+  typeCheckKey(key)
+  return get(this, key, false)
+}
+
+LRUCache.prototype.pop = function () {
+  var hit = this._lruList[this._lru]
+  del(this, hit)
+  return hit || null
+}
+
+LRUCache.prototype.del = function (key) {
+  typeCheckKey(key)
+  del(this, this._cache[key])
+}
+
+LRUCache.prototype.load = function (arr) {
+  //reset the cache
+  this.reset();
+
+  var now = Date.now()
+  //A previous serialized cache has the most recent items first
+  for (var l = arr.length - 1; l >= 0; l-- ) {
+    var hit = arr[l]
+    typeCheckKey(hit.k)
+    var expiresAt = hit.e || 0
+    if (expiresAt === 0) {
+      //the item was created without expiration in a non aged cache
+      this.set(hit.k, hit.v)
+    } else {
+      var maxAge = expiresAt - now
+      //dont add already expired items
+      if (maxAge > 0) this.set(hit.k, hit.v, maxAge)
+    }
+  }
+}
+
+function get (self, key, doUse) {
+  typeCheckKey(key)
+  var hit = self._cache[key]
+  if (hit) {
+    if (isStale(self, hit)) {
+      del(self, hit)
+      if (!self._allowStale) hit = undefined
+    } else {
+      if (doUse) use(self, hit)
+    }
+    if (hit) hit = hit.value
+  }
+  return hit
+}
+
+function isStale(self, hit) {
+  if (!hit || (!hit.maxAge && !self._maxAge)) return false
+  var stale = false;
+  var diff = Date.now() - hit.now
+  if (hit.maxAge) {
+    stale = diff > hit.maxAge
+  } else {
+    stale = self._maxAge && (diff > self._maxAge)
+  }
+  return stale;
+}
+
+function use (self, hit) {
+  shiftLU(self, hit)
+  hit.lu = self._mru ++
+  self._lruList[hit.lu] = hit
+}
+
+function trim (self) {
+  while (self._lru < self._mru && self._length > self._max)
+    del(self, self._lruList[self._lru])
+}
+
+function shiftLU (self, hit) {
+  delete self._lruList[ hit.lu ]
+  while (self._lru < self._mru && !self._lruList[self._lru]) self._lru ++
+}
+
+function del (self, hit) {
+  if (hit) {
+    if (self._dispose) self._dispose(hit.key, hit.value)
+    self._length -= hit.length
+    self._itemCount --
+    delete self._cache[ hit.key ]
+    shiftLU(self, hit)
+  }
+}
+
+// classy, since V8 prefers predictable objects.
+function Entry (key, value, lu, length, now, maxAge) {
+  this.key = key
+  this.value = value
+  this.lu = lu
+  this.length = length
+  this.now = now
+  if (maxAge) this.maxAge = maxAge
+}
+
+})()
+
+},{}],6:[function(require,module,exports){
+// shim for using process in browser
+var process = module.exports = {};
+
+// cached from whatever global is present so that test runners that stub it
+// don't break things.  But we need to wrap it in a try catch in case it is
+// wrapped in strict mode code which doesn't define any globals.  It's inside a
+// function because try/catches deoptimize in certain engines.
+
+var cachedSetTimeout;
+var cachedClearTimeout;
+
+function defaultSetTimout() {
+    throw new Error('setTimeout has not been defined');
+}
+function defaultClearTimeout () {
+    throw new Error('clearTimeout has not been defined');
+}
+(function () {
+    try {
+        if (typeof setTimeout === 'function') {
+            cachedSetTimeout = setTimeout;
+        } else {
+            cachedSetTimeout = defaultSetTimout;
+        }
+    } catch (e) {
+        cachedSetTimeout = defaultSetTimout;
+    }
+    try {
+        if (typeof clearTimeout === 'function') {
+            cachedClearTimeout = clearTimeout;
+        } else {
+            cachedClearTimeout = defaultClearTimeout;
+        }
+    } catch (e) {
+        cachedClearTimeout = defaultClearTimeout;
+    }
+} ())
+function runTimeout(fun) {
+    if (cachedSetTimeout === setTimeout) {
+        //normal enviroments in sane situations
+        return setTimeout(fun, 0);
+    }
+    // if setTimeout wasn't available but was latter defined
+    if ((cachedSetTimeout === defaultSetTimout || !cachedSetTimeout) && setTimeout) {
+        cachedSetTimeout = setTimeout;
+        return setTimeout(fun, 0);
+    }
+    try {
+        // when when somebody has screwed with setTimeout but no I.E. maddness
+        return cachedSetTimeout(fun, 0);
+    } catch(e){
+        try {
+            // When we are in I.E. but the script has been evaled so I.E. doesn't trust the global object when called normally
+            return cachedSetTimeout.call(null, fun, 0);
+        } catch(e){
+            // same as above but when it's a version of I.E. that must have the global object for 'this', hopfully our context correct otherwise it will throw a global error
+            return cachedSetTimeout.call(this, fun, 0);
+        }
+    }
+
+
+}
+function runClearTimeout(marker) {
+    if (cachedClearTimeout === clearTimeout) {
+        //normal enviroments in sane situations
+        return clearTimeout(marker);
+    }
+    // if clearTimeout wasn't available but was latter defined
+    if ((cachedClearTimeout === defaultClearTimeout || !cachedClearTimeout) && clearTimeout) {
+        cachedClearTimeout = clearTimeout;
+        return clearTimeout(marker);
+    }
+    try {
+        // when when somebody has screwed with setTimeout but no I.E. maddness
+        return cachedClearTimeout(marker);
+    } catch (e){
+        try {
+            // When we are in I.E. but the script has been evaled so I.E. doesn't  trust the global object when called normally
+            return cachedClearTimeout.call(null, marker);
+        } catch (e){
+            // same as above but when it's a version of I.E. that must have the global object for 'this', hopfully our context correct otherwise it will throw a global error.
+            // Some versions of I.E. have different rules for clearTimeout vs setTimeout
+            return cachedClearTimeout.call(this, marker);
+        }
+    }
+
+
+
+}
+var queue = [];
+var draining = false;
+var currentQueue;
+var queueIndex = -1;
+
+function cleanUpNextTick() {
+    if (!draining || !currentQueue) {
+        return;
+    }
+    draining = false;
+    if (currentQueue.length) {
+        queue = currentQueue.concat(queue);
+    } else {
+        queueIndex = -1;
+    }
+    if (queue.length) {
+        drainQueue();
+    }
+}
+
+function drainQueue() {
+    if (draining) {
+        return;
+    }
+    var timeout = runTimeout(cleanUpNextTick);
+    draining = true;
+
+    var len = queue.length;
+    while(len) {
+        currentQueue = queue;
+        queue = [];
+        while (++queueIndex < len) {
+            if (currentQueue) {
+                currentQueue[queueIndex].run();
+            }
+        }
+        queueIndex = -1;
+        len = queue.length;
+    }
+    currentQueue = null;
+    draining = false;
+    runClearTimeout(timeout);
+}
+
+process.nextTick = function (fun) {
+    var args = new Array(arguments.length - 1);
+    if (arguments.length > 1) {
+        for (var i = 1; i < arguments.length; i++) {
+            args[i - 1] = arguments[i];
+        }
+    }
+    queue.push(new Item(fun, args));
+    if (queue.length === 1 && !draining) {
+        runTimeout(drainQueue);
+    }
 };
 
-/**
- * Creates a function that delays invoking `func` until after `wait` milliseconds
- * have elapsed since the last time it was invoked. The created function comes
- * with a `cancel` method to cancel delayed invocations. Provide an options
- * object to indicate that `func` should be invoked on the leading and/or
- * trailing edge of the `wait` timeout. Subsequent calls to the debounced
- * function return the result of the last `func` invocation.
- *
- * **Note:** If `leading` and `trailing` options are `true`, `func` is invoked
- * on the trailing edge of the timeout only if the the debounced function is
- * invoked more than once during the `wait` timeout.
- *
- * See [David Corbacho's article](http://drupalmotion.com/article/debounce-and-throttle-visual-explanation)
- * for details over the differences between `_.debounce` and `_.throttle`.
- *
- * @static
- * @memberOf _
- * @category Function
- * @param {Function} func The function to debounce.
- * @param {number} [wait=0] The number of milliseconds to delay.
- * @param {Object} [options] The options object.
- * @param {boolean} [options.leading=false] Specify invoking on the leading
- *  edge of the timeout.
- * @param {number} [options.maxWait] The maximum time `func` is allowed to be
- *  delayed before it is invoked.
- * @param {boolean} [options.trailing=true] Specify invoking on the trailing
- *  edge of the timeout.
- * @returns {Function} Returns the new debounced function.
- * @example
- *
- * // avoid costly calculations while the window size is in flux
- * jQuery(window).on('resize', _.debounce(calculateLayout, 150));
- *
- * // invoke `sendMail` when the click event is fired, debouncing subsequent calls
- * jQuery('#postbox').on('click', _.debounce(sendMail, 300, {
- *   'leading': true,
- *   'trailing': false
- * }));
- *
- * // ensure `batchLog` is invoked once after 1 second of debounced calls
- * var source = new EventSource('/stream');
- * jQuery(source).on('message', _.debounce(batchLog, 250, {
- *   'maxWait': 1000
- * }));
- *
- * // cancel a debounced call
- * var todoChanges = _.debounce(batchLog, 1000);
- * Object.observe(models.todo, todoChanges);
- *
- * Object.observe(models, function(changes) {
- *   if (_.find(changes, { 'user': 'todo', 'type': 'delete'})) {
- *     todoChanges.cancel();
- *   }
- * }, ['delete']);
- *
- * // ...at some point `models.todo` is changed
- * models.todo.completed = true;
- *
- * // ...before 1 second has passed `models.todo` is deleted
- * // which cancels the debounced `todoChanges` call
- * delete models.todo;
- */
-function debounce(func, wait, options) {
-  var args,
-      maxTimeoutId,
-      result,
-      stamp,
-      thisArg,
-      timeoutId,
-      trailingCall,
-      lastCalled = 0,
-      maxWait = false,
-      trailing = true;
-
-  if (typeof func != 'function') {
-    throw new TypeError(FUNC_ERROR_TEXT);
-  }
-  wait = wait < 0 ? 0 : (+wait || 0);
-  if (options === true) {
-    var leading = true;
-    trailing = false;
-  } else if (isObject(options)) {
-    leading = options.leading;
-    maxWait = 'maxWait' in options && nativeMax(+options.maxWait || 0, wait);
-    trailing = 'trailing' in options ? options.trailing : trailing;
-  }
-
-  function cancel() {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-    if (maxTimeoutId) {
-      clearTimeout(maxTimeoutId);
-    }
-    maxTimeoutId = timeoutId = trailingCall = undefined;
-  }
-
-  function delayed() {
-    var remaining = wait - (now() - stamp);
-    if (remaining <= 0 || remaining > wait) {
-      if (maxTimeoutId) {
-        clearTimeout(maxTimeoutId);
-      }
-      var isCalled = trailingCall;
-      maxTimeoutId = timeoutId = trailingCall = undefined;
-      if (isCalled) {
-        lastCalled = now();
-        result = func.apply(thisArg, args);
-        if (!timeoutId && !maxTimeoutId) {
-          args = thisArg = null;
-        }
-      }
-    } else {
-      timeoutId = setTimeout(delayed, remaining);
-    }
-  }
-
-  function maxDelayed() {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-    maxTimeoutId = timeoutId = trailingCall = undefined;
-    if (trailing || (maxWait !== wait)) {
-      lastCalled = now();
-      result = func.apply(thisArg, args);
-      if (!timeoutId && !maxTimeoutId) {
-        args = thisArg = null;
-      }
-    }
-  }
-
-  function debounced() {
-    args = arguments;
-    stamp = now();
-    thisArg = this;
-    trailingCall = trailing && (timeoutId || !leading);
-
-    if (maxWait === false) {
-      var leadingCall = leading && !timeoutId;
-    } else {
-      if (!maxTimeoutId && !leading) {
-        lastCalled = stamp;
-      }
-      var remaining = maxWait - (stamp - lastCalled),
-          isCalled = remaining <= 0 || remaining > maxWait;
-
-      if (isCalled) {
-        if (maxTimeoutId) {
-          maxTimeoutId = clearTimeout(maxTimeoutId);
-        }
-        lastCalled = stamp;
-        result = func.apply(thisArg, args);
-      }
-      else if (!maxTimeoutId) {
-        maxTimeoutId = setTimeout(maxDelayed, remaining);
-      }
-    }
-    if (isCalled && timeoutId) {
-      timeoutId = clearTimeout(timeoutId);
-    }
-    else if (!timeoutId && wait !== maxWait) {
-      timeoutId = setTimeout(delayed, wait);
-    }
-    if (leadingCall) {
-      isCalled = true;
-      result = func.apply(thisArg, args);
-    }
-    if (isCalled && !timeoutId && !maxTimeoutId) {
-      args = thisArg = null;
-    }
-    return result;
-  }
-  debounced.cancel = cancel;
-  return debounced;
+// v8 likes predictible objects
+function Item(fun, array) {
+    this.fun = fun;
+    this.array = array;
 }
+Item.prototype.run = function () {
+    this.fun.apply(null, this.array);
+};
+process.title = 'browser';
+process.browser = true;
+process.env = {};
+process.argv = [];
+process.version = ''; // empty string to avoid regexp issues
+process.versions = {};
 
-/**
- * Checks if `value` is the language type of `Object`.
- * (e.g. arrays, functions, objects, regexes, `new Number(0)`, and `new String('')`)
- *
- * **Note:** See the [ES5 spec](https://es5.github.io/#x8) for more details.
- *
- * @static
- * @memberOf _
- * @category Lang
- * @param {*} value The value to check.
- * @returns {boolean} Returns `true` if `value` is an object, else `false`.
- * @example
- *
- * _.isObject({});
- * // => true
- *
- * _.isObject([1, 2, 3]);
- * // => true
- *
- * _.isObject(1);
- * // => false
- */
-function isObject(value) {
-  // Avoid a V8 JIT bug in Chrome 19-20.
-  // See https://code.google.com/p/v8/issues/detail?id=2291 for more details.
-  var type = typeof value;
-  return type == 'function' || (value && type == 'object') || false;
-}
+function noop() {}
 
-module.exports = debounce;
+process.on = noop;
+process.addListener = noop;
+process.once = noop;
+process.off = noop;
+process.removeListener = noop;
+process.removeAllListeners = noop;
+process.emit = noop;
+process.prependListener = noop;
+process.prependOnceListener = noop;
 
-},{"lodash.isnative":6}],6:[function(require,module,exports){
-/**
- * lodash 3.0.0 (Custom Build) <https://lodash.com/>
- * Build: `lodash modern modularize exports="npm" -o ./`
- * Copyright 2012-2015 The Dojo Foundation <http://dojofoundation.org/>
- * Based on Underscore.js 1.7.0 <http://underscorejs.org/LICENSE>
- * Copyright 2009-2015 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
- * Available under MIT license <https://lodash.com/license>
- */
+process.listeners = function (name) { return [] }
 
-/** `Object#toString` result references. */
-var funcTag = '[object Function]';
+process.binding = function (name) {
+    throw new Error('process.binding is not supported');
+};
 
-/** Used to detect host constructors (Safari > 5). */
-var reHostCtor = /^\[object .+?Constructor\]$/;
-
-/**
- * Used to match `RegExp` special characters.
- * See this [article on `RegExp` characters](http://www.regular-expressions.info/characters.html#special)
- * for more details.
- */
-var reRegExpChars = /[.*+?^${}()|[\]\/\\]/g,
-    reHasRegExpChars = RegExp(reRegExpChars.source);
-
-/**
- * Converts `value` to a string if it is not one. An empty string is returned
- * for `null` or `undefined` values.
- *
- * @private
- * @param {*} value The value to process.
- * @returns {string} Returns the string.
- */
-function baseToString(value) {
-  if (typeof value == 'string') {
-    return value;
-  }
-  return value == null ? '' : (value + '');
-}
-
-/**
- * Checks if `value` is object-like.
- *
- * @private
- * @param {*} value The value to check.
- * @returns {boolean} Returns `true` if `value` is object-like, else `false`.
- */
-function isObjectLike(value) {
-  return (value && typeof value == 'object') || false;
-}
-
-/** Used for native method references. */
-var objectProto = Object.prototype;
-
-/** Used to resolve the decompiled source of functions. */
-var fnToString = Function.prototype.toString;
-
-/**
- * Used to resolve the `toStringTag` of values.
- * See the [ES spec](https://people.mozilla.org/~jorendorff/es6-draft.html#sec-object.prototype.tostring)
- * for more details.
- */
-var objToString = objectProto.toString;
-
-/** Used to detect if a method is native. */
-var reNative = RegExp('^' +
-  escapeRegExp(objToString)
-  .replace(/toString|(function).*?(?=\\\()| for .+?(?=\\\])/g, '$1.*?') + '$'
-);
-
-/**
- * Checks if `value` is a native function.
- *
- * @static
- * @memberOf _
- * @category Lang
- * @param {*} value The value to check.
- * @returns {boolean} Returns `true` if `value` is a native function, else `false`.
- * @example
- *
- * _.isNative(Array.prototype.push);
- * // => true
- *
- * _.isNative(_);
- * // => false
- */
-function isNative(value) {
-  if (value == null) {
-    return false;
-  }
-  if (objToString.call(value) == funcTag) {
-    return reNative.test(fnToString.call(value));
-  }
-  return (isObjectLike(value) && reHostCtor.test(value)) || false;
-}
-
-/**
- * Escapes the `RegExp` special characters "\", "^", "$", ".", "|", "?", "*",
- * "+", "(", ")", "[", "]", "{" and "}" in `string`.
- *
- * @static
- * @memberOf _
- * @category String
- * @param {string} [string=''] The string to escape.
- * @returns {string} Returns the escaped string.
- * @example
- *
- * _.escapeRegExp('[lodash](https://lodash.com/)');
- * // => '\[lodash\]\(https://lodash\.com/\)'
- */
-function escapeRegExp(string) {
-  string = baseToString(string);
-  return (string && reHasRegExpChars.test(string))
-    ? string.replace(reRegExpChars, '\\$&')
-    : string;
-}
-
-module.exports = isNative;
+process.cwd = function () { return '/' };
+process.chdir = function (dir) {
+    throw new Error('process.chdir is not supported');
+};
+process.umask = function() { return 0; };
 
 },{}],7:[function(require,module,exports){
-"use strict";
-/* jshint esnext: false */
+(function (process){
+module.exports = function (tasks, cb) {
+  var results, pending, keys
+  var isSync = true
 
-/**
-  CAUTION!!!!
-  This file is used in WebWorker.
-  So, must write with ES5, not use ES6.
-  You need attention not to be traspiled by babel.
-*/
-
-var self = {};
-
-function encoder() {
-  self.onmessage = function (e) {
-    switch (e.data.type) {
-      case "encode":
-        self.encode(e.data.audioData, e.data.format).then(function (buffer) {
-          var data = {
-            type: "encoded",
-            callbackId: e.data.callbackId,
-            buffer: buffer
-          };
-          self.postMessage(data, [buffer]);
-        }, function (err) {
-          var data = {
-            type: "error",
-            callbackId: e.data.callbackId,
-            message: err.message
-          };
-          self.postMessage(data);
-        });
-        break;
-    }
-  };
-
-  self.encode = function (audioData, format) {
-    format.floatingPoint = !!format.floatingPoint;
-    format.bitDepth = format.bitDepth | 0 || 16;
-
-    return new Promise(function (resolve) {
-      var numberOfChannels = audioData.numberOfChannels;
-      var sampleRate = audioData.sampleRate;
-      var bytes = format.bitDepth >> 3;
-      var length = audioData.length * numberOfChannels * bytes;
-      var writer = new BufferWriter(44 + length);
-
-      writer.writeString("RIFF"); // RIFF header
-      writer.writeUint32(writer.length - 8); // file length
-      writer.writeString("WAVE"); // RIFF Type
-
-      writer.writeString("fmt "); // format chunk identifier
-      writer.writeUint32(16); // format chunk length
-      writer.writeUint16(format.floatingPoint ? 3 : 1); // format (PCM)
-      writer.writeUint16(numberOfChannels); // number of channels
-      writer.writeUint32(sampleRate); // sample rate
-      writer.writeUint32(sampleRate * numberOfChannels * bytes); // byte rate
-      writer.writeUint16(numberOfChannels * bytes); // block size
-      writer.writeUint16(format.bitDepth); // bits per sample
-
-      writer.writeString("data"); // data chunk identifier
-      writer.writeUint32(length); // data chunk length
-
-      var channelData = audioData.buffers.map(function (buffer) {
-        return new Float32Array(buffer);
-      });
-
-      writer.writePCM(channelData, format);
-
-      resolve(writer.toArrayBuffer());
-    });
-  };
-
-  function BufferWriter(length) {
-    this.buffer = new ArrayBuffer(length);
-    this.view = new DataView(this.buffer);
-    this.length = length;
-    this.pos = 0;
+  if (Array.isArray(tasks)) {
+    results = []
+    pending = tasks.length
+  } else {
+    keys = Object.keys(tasks)
+    results = {}
+    pending = keys.length
   }
 
-  BufferWriter.prototype.writeUint8 = function (data) {
-    this.view.setUint8(this.pos, data);
-    this.pos += 1;
-  };
-
-  BufferWriter.prototype.writeUint16 = function (data) {
-    this.view.setUint16(this.pos, data, true);
-    this.pos += 2;
-  };
-
-  BufferWriter.prototype.writeUint32 = function (data) {
-    this.view.setUint32(this.pos, data, true);
-    this.pos += 4;
-  };
-
-  BufferWriter.prototype.writeString = function (data) {
-    for (var i = 0; i < data.length; i++) {
-      this.writeUint8(data.charCodeAt(i));
+  function done (err) {
+    function end () {
+      if (cb) cb(err, results)
+      cb = null
     }
-  };
+    if (isSync) process.nextTick(end)
+    else end()
+  }
 
-  BufferWriter.prototype.writePCM8 = function (x) {
-    x = Math.max(-128, Math.min(x * 128, 127)) | 0;
-    this.view.setInt8(this.pos, x);
-    this.pos += 1;
-  };
-
-  BufferWriter.prototype.writePCM16 = function (x) {
-    x = Math.max(-32768, Math.min(x * 32768, 32767)) | 0;
-    this.view.setInt16(this.pos, x, true);
-    this.pos += 2;
-  };
-
-  BufferWriter.prototype.writePCM24 = function (x) {
-    x = Math.max(-8388608, Math.min(x * 8388608, 8388607)) | 0;
-    this.view.setUint8(this.pos + 0, x >> 0 & 255);
-    this.view.setUint8(this.pos + 1, x >> 8 & 255);
-    this.view.setUint8(this.pos + 2, x >> 16 & 255);
-    this.pos += 3;
-  };
-
-  BufferWriter.prototype.writePCM32 = function (x) {
-    x = Math.max(-2147483648, Math.min(x * 2147483648, 2147483647)) | 0;
-    this.view.setInt32(this.pos, x, true);
-    this.pos += 4;
-  };
-
-  BufferWriter.prototype.writePCM32F = function (x) {
-    this.view.setFloat32(this.pos, x, true);
-    this.pos += 4;
-  };
-
-  BufferWriter.prototype.writePCM64F = function (x) {
-    this.view.setFloat64(this.pos, x, true);
-    this.pos += 8;
-  };
-
-  BufferWriter.prototype.writePCM = function (channelData, format) {
-    var length = channelData[0].length;
-    var numberOfChannels = channelData.length;
-    var method = "writePCM" + format.bitDepth;
-
-    if (format.floatingPoint) {
-      method += "F";
+  function each (i, err, result) {
+    results[i] = result
+    if (--pending === 0 || err) {
+      done(err)
     }
+  }
 
-    if (!this[method]) {
-      throw new Error("not suppoerted bit depth " + format.bitDepth);
-    }
+  if (!pending) {
+    // empty
+    done(null)
+  } else if (keys) {
+    // object
+    keys.forEach(function (key) {
+      tasks[key](function (err, result) { each(key, err, result) })
+    })
+  } else {
+    // array
+    tasks.forEach(function (task, i) {
+      task(function (err, result) { each(i, err, result) })
+    })
+  }
 
-    for (var i = 0; i < length; i++) {
-      for (var ch = 0; ch < numberOfChannels; ch++) {
-        this[method](channelData[ch][i]);
-      }
-    }
-  };
-
-  BufferWriter.prototype.toArrayBuffer = function () {
-    return this.buffer;
-  };
-
-  self.BufferWriter = BufferWriter;
+  isSync = false
 }
 
-encoder.self = encoder.util = self;
-
-module.exports = encoder;
-},{}],8:[function(require,module,exports){
+}).call(this,require('_process'))
+},{"_process":6}],8:[function(require,module,exports){
 "use strict";
 
-var _interopRequire = function (obj) { return obj && obj.__esModule ? obj["default"] : obj; };
+function encodeSync(audioData, opts) {
+  opts = opts || {};
 
-var _createClass = (function () { function defineProperties(target, props) { for (var key in props) { var prop = props[key]; prop.configurable = true; if (prop.value) prop.writable = true; } Object.defineProperties(target, props); } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
+  audioData = toAudioData(audioData);
 
-var _classCallCheck = function (instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } };
-
-"use stirct";
-
-var InlineWorker = _interopRequire(require("inline-worker"));
-
-var encoder = _interopRequire(require("./encoder-worker"));
-
-var Encoder = (function () {
-  function Encoder() {
-    var _this = this;
-
-    var format = arguments[0] === undefined ? {} : arguments[0];
-
-    _classCallCheck(this, Encoder);
-
-    this.format = {
-      floatingPoint: !!format.floatingPoint,
-      bitDepth: format.bitDepth | 0 || 16 };
-    this._worker = new InlineWorker(encoder, encoder.self);
-    this._worker.onmessage = function (e) {
-      var callback = _this._callbacks[e.data.callbackId];
-
-      if (callback) {
-        if (e.data.type === "encoded") {
-          callback.resolve(e.data.buffer);
-        } else {
-          callback.reject(new Error(e.data.message));
-        }
-      }
-
-      _this._callbacks[e.data.callbackId] = null;
-    };
-    this._callbacks = [];
+  if (audioData === null) {
+    throw new TypeError("Invalid AudioData");
   }
 
-  _createClass(Encoder, {
-    canProcess: {
-      value: function canProcess(format) {
-        return Encoder.canProcess(format);
-      }
-    },
-    encode: {
-      value: function encode(audioData, format) {
-        var _this = this;
+  var floatingPoint = !!(opts.floatingPoint || opts.float);
+  var bitDepth = floatingPoint ? 32 : ((opts.bitDepth|0) || 16);
+  var bytes = bitDepth >> 3;
+  var length = audioData.length * audioData.numberOfChannels * bytes;
+  var dataView = new DataView(new Uint8Array(44 + length).buffer);
+  var writer = createWriter(dataView);
 
-        if (format == null || typeof format !== "object") {
-          format = this.format;
-        }
-        return new Promise(function (resolve, reject) {
-          var callbackId = _this._callbacks.length;
+  var format = {
+    formatId: floatingPoint ? 0x0003 : 0x0001,
+    floatingPoint: floatingPoint,
+    numberOfChannels: audioData.numberOfChannels,
+    sampleRate: audioData.sampleRate,
+    bitDepth: bitDepth
+  };
 
-          _this._callbacks.push({ resolve: resolve, reject: reject });
+  writeHeader(writer, format, dataView.buffer.byteLength - 8);
 
-          var numberOfChannels = audioData.channelData.length;
-          var length = audioData.channelData[0].length;
-          var sampleRate = audioData.sampleRate;
-          var buffers = audioData.channelData.map(function (data) {
-            return data.buffer;
-          });
+  var err = writeData(writer, format, length, audioData, opts);
 
-          audioData = { numberOfChannels: numberOfChannels, length: length, sampleRate: sampleRate, buffers: buffers };
-
-          _this._worker.postMessage({
-            type: "encode", audioData: audioData, format: format, callbackId: callbackId
-          }, audioData.buffers);
-        });
-      }
-    }
-  }, {
-    canProcess: {
-      value: function canProcess(format) {
-        if (format && (format === "wav" || format.type === "wav")) {
-          return "maybe";
-        }
-        return "";
-      }
-    },
-    encode: {
-      value: function encode(audioData, format) {
-        return new Encoder(format).encode(audioData);
-      }
-    }
-  });
-
-  return Encoder;
-})();
-
-module.exports = Encoder;
-},{"./encoder-worker":7,"inline-worker":10}],9:[function(require,module,exports){
-"use strict";
-
-var _interopRequire = function (obj) { return obj && obj.__esModule ? obj["default"] : obj; };
-
-var Encoder = _interopRequire(require("./encoder"));
-
-module.exports = Encoder;
-},{"./encoder":8}],10:[function(require,module,exports){
-"use strict";
-
-module.exports = require("./inline-worker");
-},{"./inline-worker":11}],11:[function(require,module,exports){
-(function (global){
-"use strict";
-
-var _createClass = (function () { function defineProperties(target, props) { for (var key in props) { var prop = props[key]; prop.configurable = true; if (prop.value) prop.writable = true; } Object.defineProperties(target, props); } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; })();
-
-var _classCallCheck = function (instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } };
-
-var WORKER_ENABLED = !!(global === global.window && global.URL && global.Blob && global.Worker);
-
-var InlineWorker = (function () {
-  function InlineWorker(func, self) {
-    var _this = this;
-
-    _classCallCheck(this, InlineWorker);
-
-    if (WORKER_ENABLED) {
-      var functionBody = func.toString().trim().match(/^function\s*\w*\s*\([\w\s,]*\)\s*{([\w\W]*?)}$/)[1];
-      var url = global.URL.createObjectURL(new global.Blob([functionBody], { type: "text/javascript" }));
-
-      return new global.Worker(url);
-    }
-
-    this.self = self;
-    this.self.postMessage = function (data) {
-      setTimeout(function () {
-        _this.onmessage({ data: data });
-      }, 0);
-    };
-
-    setTimeout(function () {
-      func.call(self);
-    }, 0);
+  if (err instanceof Error) {
+    throw err;
   }
 
-  _createClass(InlineWorker, {
-    postMessage: {
-      value: function postMessage(data) {
-        var _this = this;
+  return dataView.buffer;
+}
 
-        setTimeout(function () {
-          _this.self.onmessage({ data: data });
-        }, 0);
-      }
-    }
+function encode(audioData, opts) {
+  return new Promise(function(resolve) {
+    resolve(encodeSync(audioData, opts));
   });
+}
 
-  return InlineWorker;
-})();
+function toAudioData(data) {
+  var audioData = {};
 
-module.exports = InlineWorker;
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],12:[function(require,module,exports){
+  if (typeof data.sampleRate !== "number") {
+    return null;
+  }
+  if (!Array.isArray(data.channelData)) {
+    return null;
+  }
+  if (!(data.channelData[0] instanceof Float32Array)) {
+    return null;
+  }
+
+  audioData.numberOfChannels = data.channelData.length;
+  audioData.length = data.channelData[0].length|0;
+  audioData.sampleRate = data.sampleRate|0;
+  audioData.channelData = data.channelData;
+
+  return audioData;
+}
+
+function writeHeader(writer, format, length) {
+  var bytes = format.bitDepth >> 3;
+
+  writer.string("RIFF");
+  writer.uint32(length);
+  writer.string("WAVE");
+
+  writer.string("fmt ");
+  writer.uint32(16);
+  writer.uint16(format.floatingPoint ? 0x0003 : 0x0001);
+  writer.uint16(format.numberOfChannels);
+  writer.uint32(format.sampleRate);
+  writer.uint32(format.sampleRate * format.numberOfChannels * bytes);
+  writer.uint16(format.numberOfChannels * bytes);
+  writer.uint16(format.bitDepth);
+}
+
+function writeData(writer, format, length, audioData, opts) {
+  var bitDepth = format.bitDepth;
+  var encoderOption = format.floatingPoint ? "f" : opts.symmetric ? "s" : "";
+  var methodName = "pcm" + bitDepth + encoderOption;
+
+  if (!writer[methodName]) {
+    return new TypeError("Not supported bit depth: " + bitDepth);
+  }
+
+  var write = writer[methodName].bind(writer);
+  var numberOfChannels = format.numberOfChannels;
+  var channelData = audioData.channelData;
+
+  writer.string("data");
+  writer.uint32(length);
+
+  for (var i = 0, imax = audioData.length; i < imax; i++) {
+    for (var ch = 0; ch < numberOfChannels; ch++) {
+      write(channelData[ch][i]);
+    }
+  }
+}
+
+function createWriter(dataView) {
+  var pos = 0;
+
+  return {
+    int16: function(value) {
+      dataView.setInt16(pos, value, true);
+      pos += 2;
+    },
+    uint16: function(value) {
+      dataView.setUint16(pos, value, true);
+      pos += 2;
+    },
+    uint32: function(value) {
+      dataView.setUint32(pos, value, true);
+      pos += 4;
+    },
+    string: function(value) {
+      for (var i = 0, imax = value.length; i < imax; i++) {
+        dataView.setUint8(pos++, value.charCodeAt(i));
+      }
+    },
+    pcm8: function(value) {
+      value = Math.max(-1, Math.min(value, +1));
+      value = (value * 0.5 + 0.5) * 255;
+      value = Math.round(value)|0;
+      dataView.setUint8(pos, value, true);
+      pos += 1;
+    },
+    pcm8s: function(value) {
+      value = Math.round(value * 128) + 128;
+      value = Math.max(0, Math.min(value, 255));
+      dataView.setUint8(pos, value, true);
+      pos += 1;
+    },
+    pcm16: function(value) {
+      value = Math.max(-1, Math.min(value, +1));
+      value = value < 0 ? value * 32768 : value * 32767;
+      value = Math.round(value)|0;
+      dataView.setInt16(pos, value, true);
+      pos += 2;
+    },
+    pcm16s: function(value) {
+      value = Math.round(value * 32768);
+      value = Math.max(-32768, Math.min(value, 32767));
+      dataView.setInt16(pos, value, true);
+      pos += 2;
+    },
+    pcm24: function(value) {
+      value = Math.max(-1, Math.min(value, +1));
+      value = value < 0 ? 0x1000000 + value * 8388608 : value * 8388607;
+      value = Math.round(value)|0;
+
+      var x0 = (value >>  0) & 0xFF;
+      var x1 = (value >>  8) & 0xFF;
+      var x2 = (value >> 16) & 0xFF;
+
+      dataView.setUint8(pos + 0, x0);
+      dataView.setUint8(pos + 1, x1);
+      dataView.setUint8(pos + 2, x2);
+      pos += 3;
+    },
+    pcm24s: function(value) {
+      value = Math.round(value * 8388608);
+      value = Math.max(-8388608, Math.min(value, 8388607));
+
+      var x0 = (value >>  0) & 0xFF;
+      var x1 = (value >>  8) & 0xFF;
+      var x2 = (value >> 16) & 0xFF;
+
+      dataView.setUint8(pos + 0, x0);
+      dataView.setUint8(pos + 1, x1);
+      dataView.setUint8(pos + 2, x2);
+      pos += 3;
+    },
+    pcm32: function(value) {
+      value = Math.max(-1, Math.min(value, +1));
+      value = value < 0 ? value * 2147483648 : value * 2147483647;
+      value = Math.round(value)|0;
+      dataView.setInt32(pos, value, true);
+      pos += 4;
+    },
+    pcm32s: function(value) {
+      value = Math.round(value * 2147483648);
+      value = Math.max(-2147483648, Math.min(value, +2147483647));
+      dataView.setInt32(pos, value, true);
+      pos += 4;
+    },
+    pcm32f: function(value) {
+      dataView.setFloat32(pos, value, true);
+      pos += 4;
+    }
+  };
+}
+
+module.exports.encode = encode;
+module.exports.encode.sync = encodeSync;
+
+},{}],9:[function(require,module,exports){
 "use strict";
 
 /*
@@ -1155,6 +1307,10 @@ WebAudioLoader.prototype.load = function (source, options){
 
 	var decode =  true;
 	var thisLoadCache = true;
+
+	if (!options) {
+		options = {};
+	}
 	var thisLoadOnload = options.onload || null;
 	var thisLoadOnprogress = options.onprogress || null;
 	// var startPoint = options.startPoint || 0;
@@ -1214,258 +1370,4 @@ WebAudioLoader.prototype.flushCache = function (){
 
 module.exports = WebAudioLoader;
 
-},{"lru-cache":13}],13:[function(require,module,exports){
-;(function () { // closure for web browsers
-
-if (typeof module === 'object' && module.exports) {
-  module.exports = LRUCache
-} else {
-  // just set the global for non-node platforms.
-  this.LRUCache = LRUCache
-}
-
-function hOP (obj, key) {
-  return Object.prototype.hasOwnProperty.call(obj, key)
-}
-
-function naiveLength () { return 1 }
-
-function LRUCache (options) {
-  if (!(this instanceof LRUCache))
-    return new LRUCache(options)
-
-  if (typeof options === 'number')
-    options = { max: options }
-
-  if (!options)
-    options = {}
-
-  this._max = options.max
-  // Kind of weird to have a default max of Infinity, but oh well.
-  if (!this._max || !(typeof this._max === "number") || this._max <= 0 )
-    this._max = Infinity
-
-  this._lengthCalculator = options.length || naiveLength
-  if (typeof this._lengthCalculator !== "function")
-    this._lengthCalculator = naiveLength
-
-  this._allowStale = options.stale || false
-  this._maxAge = options.maxAge || null
-  this._dispose = options.dispose
-  this.reset()
-}
-
-// resize the cache when the max changes.
-Object.defineProperty(LRUCache.prototype, "max",
-  { set : function (mL) {
-      if (!mL || !(typeof mL === "number") || mL <= 0 ) mL = Infinity
-      this._max = mL
-      if (this._length > this._max) trim(this)
-    }
-  , get : function () { return this._max }
-  , enumerable : true
-  })
-
-// resize the cache when the lengthCalculator changes.
-Object.defineProperty(LRUCache.prototype, "lengthCalculator",
-  { set : function (lC) {
-      if (typeof lC !== "function") {
-        this._lengthCalculator = naiveLength
-        this._length = this._itemCount
-        for (var key in this._cache) {
-          this._cache[key].length = 1
-        }
-      } else {
-        this._lengthCalculator = lC
-        this._length = 0
-        for (var key in this._cache) {
-          this._cache[key].length = this._lengthCalculator(this._cache[key].value)
-          this._length += this._cache[key].length
-        }
-      }
-
-      if (this._length > this._max) trim(this)
-    }
-  , get : function () { return this._lengthCalculator }
-  , enumerable : true
-  })
-
-Object.defineProperty(LRUCache.prototype, "length",
-  { get : function () { return this._length }
-  , enumerable : true
-  })
-
-
-Object.defineProperty(LRUCache.prototype, "itemCount",
-  { get : function () { return this._itemCount }
-  , enumerable : true
-  })
-
-LRUCache.prototype.forEach = function (fn, thisp) {
-  thisp = thisp || this
-  var i = 0;
-  for (var k = this._mru - 1; k >= 0 && i < this._itemCount; k--) if (this._lruList[k]) {
-    i++
-    var hit = this._lruList[k]
-    if (this._maxAge && (Date.now() - hit.now > this._maxAge)) {
-      del(this, hit)
-      if (!this._allowStale) hit = undefined
-    }
-    if (hit) {
-      fn.call(thisp, hit.value, hit.key, this)
-    }
-  }
-}
-
-LRUCache.prototype.keys = function () {
-  var keys = new Array(this._itemCount)
-  var i = 0
-  for (var k = this._mru - 1; k >= 0 && i < this._itemCount; k--) if (this._lruList[k]) {
-    var hit = this._lruList[k]
-    keys[i++] = hit.key
-  }
-  return keys
-}
-
-LRUCache.prototype.values = function () {
-  var values = new Array(this._itemCount)
-  var i = 0
-  for (var k = this._mru - 1; k >= 0 && i < this._itemCount; k--) if (this._lruList[k]) {
-    var hit = this._lruList[k]
-    values[i++] = hit.value
-  }
-  return values
-}
-
-LRUCache.prototype.reset = function () {
-  if (this._dispose && this._cache) {
-    for (var k in this._cache) {
-      this._dispose(k, this._cache[k].value)
-    }
-  }
-
-  this._cache = Object.create(null) // hash of items by key
-  this._lruList = Object.create(null) // list of items in order of use recency
-  this._mru = 0 // most recently used
-  this._lru = 0 // least recently used
-  this._length = 0 // number of items in the list
-  this._itemCount = 0
-}
-
-// Provided for debugging/dev purposes only. No promises whatsoever that
-// this API stays stable.
-LRUCache.prototype.dump = function () {
-  return this._cache
-}
-
-LRUCache.prototype.dumpLru = function () {
-  return this._lruList
-}
-
-LRUCache.prototype.set = function (key, value) {
-  if (hOP(this._cache, key)) {
-    // dispose of the old one before overwriting
-    if (this._dispose) this._dispose(key, this._cache[key].value)
-    if (this._maxAge) this._cache[key].now = Date.now()
-    this._cache[key].value = value
-    this.get(key)
-    return true
-  }
-
-  var len = this._lengthCalculator(value)
-  var age = this._maxAge ? Date.now() : 0
-  var hit = new Entry(key, value, this._mru++, len, age)
-
-  // oversized objects fall out of cache automatically.
-  if (hit.length > this._max) {
-    if (this._dispose) this._dispose(key, value)
-    return false
-  }
-
-  this._length += hit.length
-  this._lruList[hit.lu] = this._cache[key] = hit
-  this._itemCount ++
-
-  if (this._length > this._max) trim(this)
-  return true
-}
-
-LRUCache.prototype.has = function (key) {
-  if (!hOP(this._cache, key)) return false
-  var hit = this._cache[key]
-  if (this._maxAge && (Date.now() - hit.now > this._maxAge)) {
-    return false
-  }
-  return true
-}
-
-LRUCache.prototype.get = function (key) {
-  return get(this, key, true)
-}
-
-LRUCache.prototype.peek = function (key) {
-  return get(this, key, false)
-}
-
-LRUCache.prototype.pop = function () {
-  var hit = this._lruList[this._lru]
-  del(this, hit)
-  return hit || null
-}
-
-LRUCache.prototype.del = function (key) {
-  del(this, this._cache[key])
-}
-
-function get (self, key, doUse) {
-  var hit = self._cache[key]
-  if (hit) {
-    if (self._maxAge && (Date.now() - hit.now > self._maxAge)) {
-      del(self, hit)
-      if (!self._allowStale) hit = undefined
-    } else {
-      if (doUse) use(self, hit)
-    }
-    if (hit) hit = hit.value
-  }
-  return hit
-}
-
-function use (self, hit) {
-  shiftLU(self, hit)
-  hit.lu = self._mru ++
-  self._lruList[hit.lu] = hit
-}
-
-function trim (self) {
-  while (self._lru < self._mru && self._length > self._max)
-    del(self, self._lruList[self._lru])
-}
-
-function shiftLU (self, hit) {
-  delete self._lruList[ hit.lu ]
-  while (self._lru < self._mru && !self._lruList[self._lru]) self._lru ++
-}
-
-function del (self, hit) {
-  if (hit) {
-    if (self._dispose) self._dispose(hit.key, hit.value)
-    self._length -= hit.length
-    self._itemCount --
-    delete self._cache[ hit.key ]
-    shiftLU(self, hit)
-  }
-}
-
-// classy, since V8 prefers predictable objects.
-function Entry (key, value, lu, length, now) {
-  this.key = key
-  this.value = value
-  this.lu = lu
-  this.length = length
-  this.now = now
-}
-
-})()
-
-},{}]},{},[1]);
+},{"lru-cache":5}]},{},[1]);
